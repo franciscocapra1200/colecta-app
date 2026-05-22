@@ -2,12 +2,6 @@ import streamlit as st
 from google.cloud import bigquery
 from google.oauth2.credentials import Credentials
 
-st.set_page_config(
-    page_title="Consulta Downgrades",
-    page_icon="📉",
-    layout="centered",
-)
-
 
 def _bq_client():
     project = "meli-bi-data"
