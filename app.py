@@ -573,4 +573,3 @@ else:
         _cta_no_aplica(seller_id)
     else:
         _cta_aplica()
-
