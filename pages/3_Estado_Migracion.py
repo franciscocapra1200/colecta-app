@@ -45,7 +45,7 @@ def get_migration_status(seller_id: int):
           AND SMI_LOGSTIC_TYPE IN ('CROSS_DOCKING')
           AND SIT_SITE_ID IN ('MLA')
           AND CUS_CUST_ID = {seller_id}
-        ORDER BY MSI_ACTIVATION_DATE_DTTM DESC
+        ORDER BY MSI_CREATION_DATE_DTTM DESC
         LIMIT 1
     """
     return client.query(query).to_dataframe()
