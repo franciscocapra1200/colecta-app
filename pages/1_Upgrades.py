@@ -2,6 +2,8 @@ import streamlit as st
 from google.cloud import bigquery
 from google.oauth2.credentials import Credentials
 
+_SBOX = "meli-bi-data.SBOX_FMMLA.COLECTA_UPGRADES_DAILY"
+
 
 def _bq_client():
     project = "meli-bi-data"
@@ -17,247 +19,6 @@ def _bq_client():
         )
         return bigquery.Client(project=project, credentials=creds)
     return bigquery.Client(project=project)
-
-
-# ── Cobertura ────────────────────────────────────────────────────────
-_COB = """
-    SELECT zip FROM UNNEST(GENERATE_ARRAY(1001, 1130)) AS zip
-    UNION ALL SELECT zip FROM UNNEST(GENERATE_ARRAY(1133, 1296)) AS zip
-    UNION ALL SELECT zip FROM UNNEST(GENERATE_ARRAY(1405, 1440)) AS zip
-    UNION ALL SELECT zip FROM UNNEST(GENERATE_ARRAY(1602, 1692)) AS zip
-    UNION ALL SELECT zip FROM UNNEST(GENERATE_ARRAY(1701, 1793)) AS zip
-    UNION ALL SELECT zip FROM UNNEST(GENERATE_ARRAY(1801, 1898)) AS zip
-    UNION ALL SELECT zip FROM UNNEST(GENERATE_ARRAY(1900, 1942)) AS zip
-    UNION ALL SELECT zip FROM UNNEST(GENERATE_ARRAY(2000, 2015)) AS zip
-    UNION ALL SELECT zip FROM UNNEST([
-      2045,2046,2107,2121,2124,2126,2129,2130,2132,
-      2150,2151,2152,2153,2154,2156,2200,2201,2202,2300,
-      2800,2802,2804,2812,2813,2814,2816,
-      3000,3002,3004,3006,3008,3016,3017,3020,3040,
-      3100,3102,3104,3106,
-      4000,4001,4002,4101,4103,4104,4105,4107,4109,4111,4116,4172,4178,
-      5000,5105,5125,5152,
-      5500,5501,5504,5505,5507,5515,5519,5521,5523,5525,5526,5527,5539,
-      6700,6702,7600,7603,7605,7606,7608,
-      8000,8001,8002,8003
-    ]) AS zip
-"""
-
-def _addr_cte(cust_id: int, alias: str = "seller_info") -> str:
-    return f"""
-{alias} AS (
-  SELECT
-    {cust_id}              AS seller,
-    MAX(CUS_CUST_NAME)     AS nombre,
-    MAX(ADD_ZIP_CODE)      AS zip,
-    MAX(ADD_STREET_NUMBER) AS street_num,
-    MAX(ADD_STATE_NAME)    AS provincia,
-    MAX(ADD_CITY_NAME)     AS ciudad
-  FROM (
-    SELECT CUS_CUST_ID, CUS_CUST_NAME, ADD_ZIP_CODE, ADD_STREET_NUMBER,
-           ADD_STATE_NAME, ADD_CITY_NAME,
-           ROW_NUMBER() OVER (PARTITION BY CUS_CUST_ID ORDER BY ADD_UPDATED_DATE DESC) AS rn
-    FROM `WHOWNER.LK_CUS_ADDRESS`
-    WHERE CUS_CUST_ID = {cust_id} AND ADD_SHIPPING_TYPE_FLAG = 1
-  ) a WHERE rn = 1
-)"""
-
-
-# ── Queries ──────────────────────────────────────────────────────────
-
-def build_query_normal(sid: int) -> str:
-    return f"""
-WITH
-params AS (
-  SELECT
-    DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 2 MONTH), MONTH) AS m2_start,
-    LAST_DAY(DATE_SUB(CURRENT_DATE(), INTERVAL 2 MONTH))           AS m2_end,
-    DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 1 MONTH), MONTH) AS m1_start,
-    LAST_DAY(DATE_SUB(CURRENT_DATE(), INTERVAL 1 MONTH))           AS m1_end
-),
-cobertura AS ({_COB}),
-{_addr_cte(sid)},
-
-ultimo_picking AS (
-  SELECT shp_picking_type_id
-  FROM `WHOWNER.BT_SHP_SHIPMENTS`
-  WHERE shp_sender_id = {sid}
-    AND sit_site_id = 'MLA' AND shp_source_id = 'MELI'
-    AND shp_shipping_mode_id = 'me2' AND shp_type = 'forward'
-    AND shp_status_id NOT IN ('cancelled','PENDING')
-  ORDER BY shp_date_handling_id DESC LIMIT 1
-),
-tiene_proximity AS (
-  SELECT COUNT(*) AS cnt
-  FROM `meli-bi-data.WHOWNER.LK_SHP_USER_PREFERENCE`
-  WHERE SHP_SENDER_ID = {sid}
-    AND SHP_SERVICE IN ('470341','496503','1266122')
-),
-shp_by_type AS (
-  SELECT
-    shp_picking_type_id,
-    DATE_TRUNC(CAST(shp_date_handling_id AS DATE), MONTH)  AS month,
-    COUNT(DISTINCT SHP_SHIPMENT_ID)                         AS shipments,
-    CAST(ROUND(SUM(shp_order_cost)) AS INT64)               AS gmv
-  FROM `WHOWNER.BT_SHP_SHIPMENTS`
-  CROSS JOIN params p
-  WHERE shp_sender_id = {sid}
-    AND sit_site_id = 'MLA' AND shp_source_id = 'MELI'
-    AND shp_shipping_mode_id = 'me2' AND shp_type = 'forward'
-    AND shp_picking_type_id IN ('xd_drop_off','drop_off')
-    AND shp_status_id NOT IN ('cancelled','PENDING')
-    AND CAST(shp_date_handling_id AS DATE) BETWEEN p.m2_start AND p.m1_end
-  GROUP BY 1,2
-),
-volumes AS (
-  SELECT
-    shp_picking_type_id,
-    MAX(IF(month=(SELECT m2_start FROM params),shipments,0))                      AS shp_m2,
-    MAX(IF(month=(SELECT m1_start FROM params),shipments,0))                      AS shp_m1,
-    MAX(IF(month=(SELECT m2_start FROM params),SAFE_DIVIDE(gmv,shipments),NULL))  AS ticket_m2,
-    MAX(IF(month=(SELECT m1_start FROM params),SAFE_DIVIDE(gmv,shipments),NULL))  AS ticket_m1
-  FROM shp_by_type GROUP BY 1
-),
-avg_ticket_pm AS (
-  SELECT
-    DATE_TRUNC(CAST(shp_date_handling_id AS DATE), MONTH) AS month,
-    SAFE_DIVIDE(CAST(ROUND(SUM(shp_order_cost)) AS INT64), COUNT(DISTINCT SHP_SHIPMENT_ID)) AS avg_t
-  FROM `WHOWNER.BT_SHP_SHIPMENTS`
-  CROSS JOIN params p
-  WHERE sit_site_id='MLA' AND shp_source_id='MELI'
-    AND shp_shipping_mode_id='me2' AND shp_type='forward'
-    AND shp_picking_type_id='cross_docking'
-    AND shp_status_id NOT IN ('cancelled','PENDING')
-    AND CAST(shp_date_handling_id AS DATE) BETWEEN p.m2_start AND p.m1_end
-  GROUP BY 1
-),
-avg_ticket AS (
-  SELECT
-    MAX(IF(month=(SELECT m2_start FROM params),avg_t,NULL)) AS avg_m2,
-    MAX(IF(month=(SELECT m1_start FROM params),avg_t,NULL)) AS avg_m1
-  FROM avg_ticket_pm
-)
-
-SELECT
-  si.seller, si.nombre, si.zip,
-  SAFE_CAST(si.zip AS INT64) AS zip_num,
-  si.provincia, si.ciudad,
-  CASE WHEN EXISTS(SELECT 1 FROM cobertura WHERE zip=SAFE_CAST(si.zip AS INT64))
-       THEN TRUE ELSE FALSE END                                                    AS tiene_cobertura,
-  COALESCE((SELECT shp_picking_type_id FROM ultimo_picking LIMIT 1)='cross_docking',FALSE) AS excluido_xd,
-  (SELECT cnt FROM tiene_proximity)>0                                              AS excluido_proximity,
-  COALESCE((SELECT shp_m2 FROM volumes WHERE shp_picking_type_id='xd_drop_off'),0) AS xddo_m2,
-  COALESCE((SELECT shp_m1 FROM volumes WHERE shp_picking_type_id='xd_drop_off'),0) AS xddo_m1,
-  (SELECT ticket_m2 FROM volumes WHERE shp_picking_type_id='xd_drop_off')          AS xddo_ticket_m2,
-  (SELECT ticket_m1 FROM volumes WHERE shp_picking_type_id='xd_drop_off')          AS xddo_ticket_m1,
-  COALESCE((SELECT shp_m2 FROM volumes WHERE shp_picking_type_id='drop_off'),0)    AS ds_m2,
-  COALESCE((SELECT shp_m1 FROM volumes WHERE shp_picking_type_id='drop_off'),0)    AS ds_m1,
-  (SELECT ticket_m2 FROM volumes WHERE shp_picking_type_id='drop_off')             AS ds_ticket_m2,
-  (SELECT ticket_m1 FROM volumes WHERE shp_picking_type_id='drop_off')             AS ds_ticket_m1,
-  (SELECT avg_m2 FROM avg_ticket)                                                   AS avg_ticket_m2,
-  (SELECT avg_m1 FROM avg_ticket)                                                   AS avg_ticket_m1
-FROM seller_info si
-"""
-
-
-def build_query_multicuenta(sid: int, madre_id: int) -> str:
-    return f"""
-WITH
-cobertura AS ({_COB}),
-{_addr_cte(sid)},
-
-madre_info AS (
-  SELECT
-    {madre_id}             AS madre,
-    MAX(ADD_ZIP_CODE)      AS zip,
-    MAX(ADD_STREET_NUMBER) AS street_num
-  FROM (
-    SELECT CUS_CUST_ID, ADD_ZIP_CODE, ADD_STREET_NUMBER,
-           ROW_NUMBER() OVER (PARTITION BY CUS_CUST_ID ORDER BY ADD_UPDATED_DATE DESC) AS rn
-    FROM `WHOWNER.LK_CUS_ADDRESS`
-    WHERE CUS_CUST_ID = {madre_id} AND ADD_SHIPPING_TYPE_FLAG = 1
-  ) a WHERE rn = 1
-),
-tiene_proximity AS (
-  SELECT COUNT(*) AS cnt
-  FROM `meli-bi-data.WHOWNER.LK_SHP_USER_PREFERENCE`
-  WHERE SHP_SENDER_ID = {sid}
-    AND SHP_SERVICE IN ('470341','496503','1266122')
-)
-
-SELECT
-  si.seller, si.nombre, si.zip, si.street_num, si.provincia, si.ciudad,
-  CASE WHEN EXISTS(SELECT 1 FROM cobertura WHERE zip=SAFE_CAST(si.zip AS INT64))
-       THEN TRUE ELSE FALSE END                                    AS tiene_cobertura,
-  (SELECT cnt FROM tiene_proximity)>0                              AS excluido_proximity,
-  EXISTS (
-    SELECT 1 FROM `meli-bi-data.WHOWNER.LK_SHP_USR_PREF_LOGISTIC_TYPES`
-    WHERE SHP_SENDER_ID={madre_id}
-      AND LOGISTIC_TYPE='cross_docking'
-      AND LOGISTIC_STATUS='active'
-      AND FECHA_HASTA IS NULL
-  )                                                                AS tiene_colecta_madre,
-  (si.zip IS NOT NULL AND si.street_num IS NOT NULL
-   AND si.zip = m.zip AND si.street_num = m.street_num)           AS mismo_domicilio,
-  m.zip          AS madre_zip,
-  m.street_num   AS madre_street_num
-FROM seller_info si
-CROSS JOIN madre_info m
-"""
-
-
-def build_query_hb(sid: int) -> str:
-    return f"""
-WITH
-params AS (
-  SELECT
-    DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 2 MONTH), MONTH) AS m2_start,
-    LAST_DAY(DATE_SUB(CURRENT_DATE(), INTERVAL 2 MONTH))           AS m2_end,
-    DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL 1 MONTH), MONTH) AS m1_start,
-    LAST_DAY(DATE_SUB(CURRENT_DATE(), INTERVAL 1 MONTH))           AS m1_end
-),
-cobertura AS ({_COB}),
-{_addr_cte(sid)},
-
-tiene_proximity AS (
-  SELECT COUNT(*) AS cnt
-  FROM `meli-bi-data.WHOWNER.LK_SHP_USER_PREFERENCE`
-  WHERE SHP_SENDER_ID = {sid}
-    AND SHP_SERVICE IN ('470341','496503','1266122')
-),
-hb_by_month AS (
-  SELECT
-    DATE_TRUNC(CAST(SHP_CREATED_DATETIME_TZ AS DATE), MONTH) AS month,
-    SHP_SHIPPING_MODE                                          AS modo,
-    COUNT(DISTINCT SHP_SHIPMENT_ID)                            AS shipments
-  FROM `WHOWNER.BT_SHP_SHIPMENTS_SUMMARY`
-  CROSS JOIN params p
-  WHERE shp_sender_id = {sid}
-    AND CAST(SHP_CREATED_DATETIME_TZ AS DATE) BETWEEN p.m2_start AND p.m1_end
-    AND SHP_SHIPPING_MODE IS NOT NULL
-    AND (
-      SHP_SHIPPING_MODE = 'ME1'
-      OR (SHP_SHIPPING_MODE = 'ME2'
-          AND SHP_PICKING_TYPE IN ('DROP_OFF','XD_DROP_OFF','CROSS_DOCKING'))
-    )
-  GROUP BY 1, 2
-)
-
-SELECT
-  si.seller, si.nombre, si.zip,
-  SAFE_CAST(si.zip AS INT64) AS zip_num,
-  si.provincia, si.ciudad,
-  CASE WHEN EXISTS(SELECT 1 FROM cobertura WHERE zip=SAFE_CAST(si.zip AS INT64))
-       THEN TRUE ELSE FALSE END                                      AS tiene_cobertura,
-  (SELECT cnt FROM tiene_proximity)>0                                AS excluido_proximity,
-  COALESCE((SELECT MAX(IF(month=(SELECT m2_start FROM params) AND modo='ME1',shipments,0)) FROM hb_by_month),0) AS me1_m2,
-  COALESCE((SELECT MAX(IF(month=(SELECT m1_start FROM params) AND modo='ME1',shipments,0)) FROM hb_by_month),0) AS me1_m1,
-  COALESCE((SELECT MAX(IF(month=(SELECT m2_start FROM params) AND modo='ME2',shipments,0)) FROM hb_by_month),0) AS me2_m2,
-  COALESCE((SELECT MAX(IF(month=(SELECT m1_start FROM params) AND modo='ME2',shipments,0)) FROM hb_by_month),0) AS me2_m1,
-  COALESCE((SELECT SUM(IF(month=(SELECT m2_start FROM params),shipments,0)) FROM hb_by_month),0) AS hb_m2,
-  COALESCE((SELECT SUM(IF(month=(SELECT m1_start FROM params),shipments,0)) FROM hb_by_month),0) AS hb_m1
-FROM seller_info si
-"""
 
 
 # ── Helpers de display ───────────────────────────────────────────────
@@ -321,16 +82,15 @@ if tipo == "Multicuenta":
         st.error("El ID de la cuenta madre debe ser un número entero.")
         st.stop()
 
-# ── Consulta ─────────────────────────────────────────────────────────
-with st.spinner("Consultando BigQuery…"):
+# ── Consulta al SBOX ─────────────────────────────────────────────────
+with st.spinner("Consultando…"):
     try:
         client = _bq_client()
-        if tipo == "Normal":
-            df = client.query(build_query_normal(seller_id)).to_dataframe()
-        elif tipo == "Multicuenta":
-            df = client.query(build_query_multicuenta(seller_id, madre_id)).to_dataframe()
+        if tipo == "Multicuenta":
+            sql = f"SELECT * FROM `{_SBOX}` WHERE seller IN ({seller_id}, {madre_id})"
         else:
-            df = client.query(build_query_hb(seller_id)).to_dataframe()
+            sql = f"SELECT * FROM `{_SBOX}` WHERE seller = {seller_id}"
+        df = client.query(sql).to_dataframe()
     except Exception as exc:
         st.error(f"Error al consultar BigQuery: {exc}")
         st.stop()
@@ -339,14 +99,19 @@ if df.empty:
     st.warning(f"No se encontró información para el Seller ID **{seller_id}**.")
     st.stop()
 
-row = df.iloc[0]
-nombre   = row.get("nombre") or f"Seller {seller_id}"
+# ── Datos base del hijo ───────────────────────────────────────────────
+hijo_rows = df[df["seller"] == seller_id]
+if hijo_rows.empty:
+    st.warning(f"No se encontró información para el Seller ID **{seller_id}**.")
+    st.stop()
+
+row      = hijo_rows.iloc[0]
 zip_num  = int(row["zip_num"]) if row.get("zip_num") else 0
-zip_code = str(zip_num) if zip_num else (str(row.get("zip","")) or "Sin CP")
+zip_code = str(zip_num) if zip_num else (str(row.get("zip", "")) or "Sin CP")
 provincia = row.get("provincia") or "N/D"
 ciudad    = row.get("ciudad")    or "N/D"
 
-st.subheader(f"{nombre}  —  ID: {seller_id}")
+st.subheader(f"Seller ID: {seller_id}")
 st.caption(f"📍 {ciudad}, {provincia}  |  CP: {zip_code}")
 st.divider()
 
@@ -460,13 +225,28 @@ if tipo == "Normal":
 #  MULTICUENTA
 # ════════════════════════════════════════════════════════════════════
 elif tipo == "Multicuenta":
-    tiene_cob      = bool(row["tiene_cobertura"])
-    excl_prox      = bool(row["excluido_proximity"])
-    tiene_col_mad  = bool(row["tiene_colecta_madre"])
-    mismo_dom      = bool(row["mismo_domicilio"])
-    madre_zip      = str(row["madre_zip"])      if row.get("madre_zip")      else "Sin CP"
-    madre_street   = str(row["madre_street_num"]) if row.get("madre_street_num") else "Sin número"
-    hijo_street    = str(row.get("street_num", "")) or "Sin número"
+    madre_rows = df[df["seller"] == madre_id]
+
+    tiene_cob   = bool(row["tiene_cobertura"])
+    excl_prox   = bool(row["excluido_proximity"])
+    hijo_street = str(row.get("street_num", "") or "") or "Sin número"
+
+    if not madre_rows.empty:
+        madre_row     = madre_rows.iloc[0]
+        tiene_col_mad = bool(madre_row["tiene_colecta_activa"])
+        madre_zip     = str(madre_row.get("zip", "") or "") or "Sin CP"
+        madre_street  = str(madre_row.get("street_num", "") or "") or "Sin número"
+        mismo_dom     = (
+            row.get("zip") is not None and row.get("street_num") is not None
+            and madre_row.get("zip") is not None and madre_row.get("street_num") is not None
+            and str(row["zip"]) == str(madre_row["zip"])
+            and str(row["street_num"]) == str(madre_row["street_num"])
+        )
+    else:
+        tiene_col_mad = False
+        madre_zip     = "Sin CP"
+        madre_street  = "Sin número"
+        mismo_dom     = False
 
     aplica = tiene_col_mad and mismo_dom and tiene_cob and not excl_prox
 
@@ -481,13 +261,13 @@ elif tipo == "Multicuenta":
     c1, c2 = st.columns(2)
     c1.metric("Colecta activa en cuenta madre", f"{ok(tiene_col_mad)} {'Sí' if tiene_col_mad else 'No'}")
     c1.caption(f"ID madre: {madre_id}")
-    c2.metric("Mismo domicilio",               f"{ok(mismo_dom)} {'Sí' if mismo_dom else 'No'}")
+    c2.metric("Mismo domicilio", f"{ok(mismo_dom)} {'Sí' if mismo_dom else 'No'}")
     c2.caption(f"Madre → CP: {madre_zip} / Nro: {madre_street}  |  Hijo → CP: {zip_code} / Nro: {hijo_street}")
 
     c3, c4 = st.columns(2)
-    c3.metric("Cobertura geográfica",  f"{ok(tiene_cob)} {'Aplica' if tiene_cob else 'Sin cobertura'}")
+    c3.metric("Cobertura geográfica", f"{ok(tiene_cob)} {'Aplica' if tiene_cob else 'Sin cobertura'}")
     c3.caption(f"CP: {zip_code}")
-    c4.metric("Proximity",             f"{ok(not excl_prox)} {'Sin proximity' if not excl_prox else 'Tiene proximity'}")
+    c4.metric("Proximity", f"{ok(not excl_prox)} {'Sin proximity' if not excl_prox else 'Tiene proximity'}")
 
     if not aplica:
         st.divider()
